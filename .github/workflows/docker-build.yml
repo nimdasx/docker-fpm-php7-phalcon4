@@ -1,0 +1,138 @@
+name: Build & Push Docker Images
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      push_images:
+        description: 'Push images ke registry'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build PHP 7.4 (${{ matrix.platform.suffix }})
+    runs-on: ${{ matrix.platform.os }}
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: ubuntu-latest
+            arch: linux/amd64
+            suffix: amd64
+          - os: ubuntu-24.04-arm
+            arch: linux/arm64
+            suffix: arm64
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry (GHCR)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_images)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: env.DOCKERHUB_USERNAME != '' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_images))
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tentukan Tags
+        id: meta
+        run: |
+          SUFFIX="${{ matrix.platform.suffix }}"
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          
+          TAGS="ghcr.io/${OWNER_LC}/fpm-php7-phalcon4:7.4-${SUFFIX},ghcr.io/${OWNER_LC}/fpm-php7-phalcon4:latest-${SUFFIX}"
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            TAGS="${TAGS},${DOCKERHUB_USERNAME}/fpm-php7-phalcon4:7.4-${SUFFIX},${DOCKERHUB_USERNAME}/fpm-php7-phalcon4:latest-${SUFFIX}"
+          fi
+          
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push (Native Architecture)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform.arch }}
+          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_images) }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.platform.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform.suffix }}
+
+  merge:
+    name: Merge Manifest Multi-Arch
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_images)
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Gabungkan Manifest Multi-Arch
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          
+          echo "Menggabungkan manifest untuk GHCR..."
+          docker buildx imagetools create \
+            -t ghcr.io/${OWNER_LC}/fpm-php7-phalcon4:7.4 \
+            -t ghcr.io/${OWNER_LC}/fpm-php7-phalcon4:latest \
+            ghcr.io/${OWNER_LC}/fpm-php7-phalcon4:7.4-amd64 \
+            ghcr.io/${OWNER_LC}/fpm-php7-phalcon4:7.4-arm64
+          
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            echo "Menggabungkan manifest untuk Docker Hub..."
+            docker buildx imagetools create \
+              -t ${DOCKERHUB_USERNAME}/fpm-php7-phalcon4:7.4 \
+              -t ${DOCKERHUB_USERNAME}/fpm-php7-phalcon4:latest \
+              ${DOCKERHUB_USERNAME}/fpm-php7-phalcon4:7.4-amd64 \
+              ${DOCKERHUB_USERNAME}/fpm-php7-phalcon4:7.4-arm64
+          fi
+          
+          echo "✓ Selesai membuat manifest multi-arch untuk PHP 7.4!"
